@@ -266,6 +266,18 @@ class GatewayService : Service(), MqttPublisher.Listener {
                 config,
                 credentials,
                 object : MqttPublisher.Listener {
+                    override fun onHomeAssistantBirth() {
+                        mainHandler.post {
+                            if (!stopped && connected && publisherGeneration.isCurrent(generation) && configStore.load().publishHomeAssistant) {
+                                discoveryEpoch++
+                                discoveryInFlight = false
+                                discoveryTracker.reset()
+                                replaySnapshot()
+                                pumpQueue()
+                            }
+                        }
+                    }
+
                     override fun onConnected(reconnecting: Boolean) {
                         mainHandler.post {
                             if (!stopped && publisherGeneration.isCurrent(generation)) {
@@ -293,7 +305,8 @@ class GatewayService : Service(), MqttPublisher.Listener {
                             }
                         }
                     }
-                }
+                },
+                discoveryAllowed = { configStore.load().publishHomeAssistant }
             )
             publisher = newPublisher
             updateStatus("Conectando ao broker")

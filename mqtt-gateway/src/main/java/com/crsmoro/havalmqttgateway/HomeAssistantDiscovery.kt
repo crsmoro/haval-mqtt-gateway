@@ -12,13 +12,15 @@ import com.google.gson.Gson
  * conservative but not exhaustive: callers must pass only independently verified read-only
  * observations. VINs are safe topic segments here, not validated as actual VINs.
  *
- * Unrecognized keys get generic sensors; known metadata requires explicit source evidence.
+ * Unrecognized keys get generic sensors; selected names and some types are inferred from keys.
+ * Binary domains can be read from [Message.topic] when retiring older retained configs.
  * Key case is preserved in the data topic, while identifiers use reversible hex.
  * Message specifies retained QoS 1; an external publisher must actually apply those flags,
  * persist/replay discovery as needed, and retire obsolete retained configs explicitly.
  * VINs and telemetry are sensitive; restrict access to both discovery and data topics.
  */
 object HomeAssistantDiscovery {
+    private const val SAFE_VALUE = "{% set d = value | from_json({}) %}{% set v = d.get('raw_value') if d is mapping else none %}"
     data class Message(val topic: String, val payload: String) {
         val qos: Int get() = 1
         val retained: Boolean get() = true
@@ -31,28 +33,56 @@ object HomeAssistantDiscovery {
         val node = "vin_" + encode(vin)
         val objectId = "key_" + encode(key)
         val payload = linkedMapOf(
-            "name" to key,
+            "name" to HomeAssistantEntityMetadata.name(key),
             "unique_id" to "${node}_${objectId}",
             "state_topic" to "$dataRoot/$vin/$key",
             "value_template" to "{{ value_json.raw_value }}",
             "device" to mapOf("identifiers" to listOf(node), "name" to "Haval $vin")
         )
+        HomeAssistantEntityMetadata.icon(key)?.let { payload["icon"] = it }
         // Units follow the producer's explicit display/calculation contracts. No
         // state_class is assumed, including for the potentially resettable odometer.
         val metadata = when (key) {
             "car.basic.vehicle_speed" -> "speed" to "km/h"
-            "car.basic.total_odometer" -> "distance" to "km"
+            "car.basic.total_odometer", "car.basic.remain_odometer",
+            "car.ev_info.electric_mode_remain_odometer", "car.ev_info.fuel_mode_remain_odometer" -> "distance" to "km"
             "car.basic.battery_voltage", "car.ev_info.power_battery_voltage" -> "voltage" to "V"
-            "car.ev_info.cur_charge_current" -> "current" to "A"
+            "car.ev_info.cur_charge_current", "car.ev_info.power_battery_current" -> "current" to "A"
+            "car.basic.steering_wheel_angle" -> null to "°"
             "car.basic.engine_speed" -> null to "rpm"
+            "car.ev_info.battery_charge_percentage", "car.ev_info.cur_battery_power_percentage", "car.ev_info.soc_of_battery" -> "battery" to "%"
+            "car.basic.remain_fuel_percentage", "car.ev_info.energy_output_percentage" -> null to "%"
             else -> null
         }
         metadata?.let { (deviceClass, unit) ->
             if (deviceClass != null) payload["device_class"] = deviceClass
             payload["unit_of_measurement"] = unit
+            // Signed quantities can legitimately be negative. A reported -1 sentinel
+            // for battery current cannot be distinguished from a valid -1 A reading.
+            // is_number rejects non-finite inputs before float can default to zero.
+            val validRange = when {
+                key == "car.basic.engine_speed" -> " and 0 <= (v | float) <= 8000 and (v | float | round(0)) not in [1023, 2047, 65535]"
+                key in setOf("car.ev_info.cur_charge_current", "car.ev_info.power_battery_current", "car.basic.steering_wheel_angle", "car.ev_info.energy_output_percentage") -> ""
+                unit == "%" -> " and 0 <= (v | float) <= 100"
+                else -> " and (v | float) >= 0"
+            }
+            payload["value_template"] = SAFE_VALUE + "{{ v | float if is_number(v)$validRange else none }}"
+        }
+        if (key == "car.hvac.cycle_mode") {
+            payload["value_template"] = SAFE_VALUE + "{{ {'0': 'Recirculação', '1': 'Ar externo'}.get(v | string, none) }}"
+        }
+        if (key == "haval.power.flow") {
+            payload["value_template"] = SAFE_VALUE + "{% set p = (v | string).split('|') %}{{ {'idle': 'Parado', 'ev': 'Elétrico', 'regen': 'Regeneração', 'hybrid': 'Híbrido', 'ice': 'Combustão', 'charge': 'Carregamento'}.get(p[1], none) if p | length == 5 and p[0] == 'v1' else none }}"
         }
         // Synthetic ICE is explicitly serialized as 1/0, not the OEM ignition enum.
         val component = if (key == "haval.power.ice") {
+            payload["value_template"] = SAFE_VALUE + "{{ v | string if (v | string) in ['0', '1'] else none }}"
+            payload["payload_on"] = "1"
+            payload["payload_off"] = "0"
+            "binary_sensor"
+        } else if (HomeAssistantEntityMetadata.isBinaryHvac(key)) {
+            // Unknown OEM values must update HA to unknown, never keep a stale on/off.
+            payload["value_template"] = SAFE_VALUE + "{{ v | string if (v | string) in ['0', '1'] else none }}"
             payload["payload_on"] = "1"
             payload["payload_off"] = "0"
             "binary_sensor"

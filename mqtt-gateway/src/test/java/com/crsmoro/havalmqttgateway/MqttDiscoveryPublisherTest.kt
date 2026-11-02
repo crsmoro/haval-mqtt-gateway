@@ -87,7 +87,7 @@ class MqttDiscoveryPublisherTest {
                 assertTrue(published.retained)
                 val json = JsonParser.parseString(published.payload).asJsonObject
                 assertEquals("gwm/haval/VIN123/car.basic.vehicle_speed", json.get("state_topic").asString)
-                assertEquals("car.basic.vehicle_speed", json.get("name").asString)
+                assertEquals("Velocidade do veículo", json.get("name").asString)
                 assertEquals(JsonParser.parseString(discovery.payload), json)
                 assertEquals(1, calls.get())
             } finally {
@@ -97,6 +97,251 @@ class MqttDiscoveryPublisherTest {
                 stopped.await(5, TimeUnit.SECONDS)
                 executor.shutdownNow()
             }
+        }
+    }
+
+    @Test fun binaryDiscoveryReannouncesLegacyThenDeletesItBeforeBinaryConfig() {
+        val topic = "homeassistant/binary_sensor/vin_74657374/key_74657374/config"
+        val legacyTopic = topic.replace("/binary_sensor/", "/sensor/")
+        val payload = """{"name":"car.lock","unique_id":"vin_74657374_key_74657374","state_topic":"gwm/haval/VIN123/car.lock","value_template":"{{ value_json.raw_value }}","device":{"identifiers":["vin_74657374"],"name":"Haval VIN123"},"payload_on":"1","payload_off":"0"}"""
+        ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { server ->
+            server.soTimeout = 10_000
+            val executor = Executors.newSingleThreadExecutor()
+            val first = java.util.concurrent.LinkedBlockingQueue<WirePublish>()
+            val release = CountDownLatch(1)
+            val completed = CountDownLatch(1)
+            val packets = executor.submit<List<WirePublish>> {
+                server.accept().use { socket ->
+                    socket.soTimeout = 10_000
+                    val input = DataInputStream(socket.getInputStream())
+                    val output = socket.getOutputStream()
+                    check(readPacket(input).first == 0x10)
+                    output.write(byteArrayOf(0x20, 2, 0, 0)); output.flush()
+                    val sent = (0..2).map { index ->
+                        val (header, body) = readPacket(input)
+                        check(header shr 4 == 3)
+                        val len = ((body[0].toInt() and 255) shl 8) or (body[1].toInt() and 255)
+                        val offset = 2 + len
+                        val packet = WirePublish(String(body, 2, len, Charsets.UTF_8),
+                            String(body, offset + 2, body.size - offset - 2, Charsets.UTF_8),
+                            (header shr 1) and 3, header and 1 != 0)
+                        if (index == 0) { first.put(packet); check(release.await(10, TimeUnit.SECONDS)) }
+                        output.write(byteArrayOf(0x40, 2, body[offset], body[offset + 1])); output.flush()
+                        packet
+                    }
+                    check(completed.await(10, TimeUnit.SECONDS))
+                    sent
+                }
+            }
+            val connected = CountDownLatch(1)
+            val result = AtomicReference<Boolean>()
+            val publisher = publisher(server.localPort, connected)
+            try {
+                publisher.connect()
+                assertTrue(connected.await(10, TimeUnit.SECONDS))
+                publisher.publishDiscovery(HomeAssistantDiscovery.Message(topic, payload)) { result.set(it); completed.countDown() }
+                val initial = first.poll(10, TimeUnit.SECONDS) ?: error("first publish missing")
+                assertEquals(legacyTopic, initial.topic)
+                assertEquals(1, initial.qos)
+                assertFalse(initial.retained)
+                val json = JsonParser.parseString(initial.payload).asJsonObject
+                assertEquals("vin_74657374_key_74657374", json.get("unique_id").asString)
+                assertEquals("gwm/haval/VIN123/car.lock", json.get("state_topic").asString)
+                assertEquals("{{ value_json.raw_value }}", json.get("value_template").asString)
+                assertEquals(JsonParser.parseString(payload).asJsonObject.get("device"), json.get("device"))
+                assertFalse(json.has("payload_on")); assertFalse(json.has("payload_off"))
+                assertFalse(completed.await(300, TimeUnit.MILLISECONDS))
+                release.countDown()
+                val sent = packets.get(10, TimeUnit.SECONDS)
+                assertEquals(WirePublish(legacyTopic, "", 1, true), sent[1])
+                assertEquals(WirePublish(topic, payload, 1, true), sent[2])
+                assertTrue(completed.await(10, TimeUnit.SECONDS))
+                assertEquals(true, result.get())
+            } finally {
+                release.countDown()
+                stop(publisher)
+                executor.shutdownNow()
+            }
+        }
+    }
+
+    @Test fun disablingDiscoveryBetweenAcknowledgementsDoesNotSendTombstone() {
+        ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { server ->
+            val executor = Executors.newSingleThreadExecutor()
+            val first = CountDownLatch(1); val ack = CountDownLatch(1)
+            val noTombstone = executor.submit<Boolean> {
+                server.accept().use { socket ->
+                    socket.soTimeout = 1000
+                    val input = DataInputStream(socket.getInputStream()); val out = socket.getOutputStream()
+                    check(readPacket(input).first == 0x10); out.write(byteArrayOf(0x20, 2, 0, 0)); out.flush()
+                    val (header, body) = readPacket(input); check(header shr 4 == 3)
+                    val len = ((body[0].toInt() and 255) shl 8) or (body[1].toInt() and 255)
+                    val offset = 2 + len; first.countDown(); check(ack.await(10, TimeUnit.SECONDS))
+                    out.write(byteArrayOf(0x40, 2, body[offset], body[offset + 1])); out.flush()
+                    try { readPacket(input); false } catch (_: java.net.SocketTimeoutException) { true }
+                }
+            }
+            val connected = CountDownLatch(1); val completed = CountDownLatch(1)
+            val allowed = java.util.concurrent.atomic.AtomicBoolean(true); val outcome = AtomicReference<Boolean>()
+            val config = GatewayConfig(true, false, "tcp://127.0.0.1:${server.localPort}", "", "test/discovery")
+            val publisher = MqttPublisher(temporaryFolder.newFolder(), config, MqttCredentials.from("", null),
+                object : MqttPublisher.Listener {
+                    override fun onConnected(reconnecting: Boolean) { connected.countDown() }
+                    override fun onDisconnected(reason: String) = Unit
+                    override fun onPublishComplete(envelope: TelemetryEnvelope, success: Boolean, reason: String?) = Unit
+                }, { allowed.get() })
+            val payload = """{"unique_id":"id","state_topic":"root/VIN123/car.lock","value_template":"{{ value_json.raw_value }}","device":{"identifiers":["vin"]}}"""
+            try {
+                publisher.connect(); assertTrue(connected.await(10, TimeUnit.SECONDS))
+                publisher.publishDiscovery(HomeAssistantDiscovery.Message("homeassistant/binary_sensor/node/key/config", payload)) { outcome.set(it); completed.countDown() }
+                assertTrue(first.await(10, TimeUnit.SECONDS)); allowed.set(false); ack.countDown()
+                assertTrue(completed.await(10, TimeUnit.SECONDS)); assertEquals(false, outcome.get())
+                assertTrue("Disabled discovery sent another packet", noTombstone.get(10, TimeUnit.SECONDS))
+            } finally { ack.countDown(); stop(publisher); executor.shutdownNow() }
+        }
+    }
+
+    @Test fun alreadyBinaryIcePublishesOnlyItsConfig() {
+        ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { server ->
+            val executor = Executors.newSingleThreadExecutor()
+            val packet = executor.submit<WirePublish> {
+                server.accept().use { socket ->
+                    socket.soTimeout = 10_000
+                    val input = DataInputStream(socket.getInputStream()); val out = socket.getOutputStream()
+                    check(readPacket(input).first == 0x10); out.write(byteArrayOf(0x20, 2, 0, 0)); out.flush()
+                    val (header, body) = readPacket(input)
+                    val len = ((body[0].toInt() and 255) shl 8) or (body[1].toInt() and 255)
+                    val offset = 2 + len
+                    val result = WirePublish(String(body, 2, len, Charsets.UTF_8), String(body, offset + 2, body.size - offset - 2, Charsets.UTF_8), (header shr 1) and 3, header and 1 != 0)
+                    out.write(byteArrayOf(0x40, 2, body[offset], body[offset + 1])); out.flush()
+                    while (input.read() != -1) { }
+                    result
+                }
+            }
+            val connected = CountDownLatch(1); val completed = CountDownLatch(1); val outcome = AtomicReference<Boolean>()
+            val publisher = publisher(server.localPort, connected)
+            val message = HomeAssistantDiscovery.build("VIN123", "haval.power.ice")!!
+            try {
+                publisher.connect(); assertTrue(connected.await(10, TimeUnit.SECONDS))
+                publisher.publishDiscovery(message) { outcome.set(it); completed.countDown() }
+                assertTrue(completed.await(10, TimeUnit.SECONDS)); assertEquals(true, outcome.get())
+                stop(publisher)
+                assertEquals(WirePublish(message.topic, message.payload, 1, true), packet.get(10, TimeUnit.SECONDS))
+            } finally { stop(publisher); executor.shutdownNow() }
+        }
+    }
+
+    @Test fun disablingAfterUnackedTombstoneDoesNotReplayItOnReconnect() {
+        ServerSocket(0, 2, InetAddress.getByName("127.0.0.1")).use { server ->
+            server.soTimeout = 10_000
+            val executor = Executors.newSingleThreadExecutor(); val dropped = CountDownLatch(1)
+            val replayed = executor.submit<Boolean> {
+                server.accept().use { socket ->
+                    socket.soTimeout = 10_000
+                    val input = DataInputStream(socket.getInputStream()); val out = socket.getOutputStream()
+                    check(readPacket(input).first == 0x10); out.write(byteArrayOf(0x20, 2, 0, 0)); out.flush()
+                    val (_, first) = readPacket(input)
+                    val len = ((first[0].toInt() and 255) shl 8) or (first[1].toInt() and 255)
+                    out.write(byteArrayOf(0x40, 2, first[2 + len], first[3 + len])); out.flush()
+                    val (header, tombstone) = readPacket(input); check(header shr 4 == 3 && header and 1 == 1)
+                    val tombLen = ((tombstone[0].toInt() and 255) shl 8) or (tombstone[1].toInt() and 255)
+                    check(tombstone.size == 2 + tombLen + 2)
+                    // Disconnect before the retained tombstone is acknowledged.
+                }
+                dropped.countDown()
+                server.accept().use { socket ->
+                    socket.soTimeout = 1500
+                    val input = DataInputStream(socket.getInputStream()); val out = socket.getOutputStream()
+                    check(readPacket(input).first == 0x10); out.write(byteArrayOf(0x20, 2, 0, 0)); out.flush()
+                    try { readPacket(input).first shr 4 == 3 } catch (_: java.net.SocketTimeoutException) { false }
+                }
+            }
+            val connected = CountDownLatch(2); val lost = CountDownLatch(1)
+            val allowed = java.util.concurrent.atomic.AtomicBoolean(true)
+            val config = GatewayConfig(true, false, "tcp://127.0.0.1:${server.localPort}", "", "test/reconnect")
+            val publisher = MqttPublisher(temporaryFolder.newFolder(), config, MqttCredentials.from("", null),
+                object : MqttPublisher.Listener {
+                    override fun onConnected(reconnecting: Boolean) { connected.countDown() }
+                    override fun onDisconnected(reason: String) { lost.countDown() }
+                    override fun onPublishComplete(envelope: TelemetryEnvelope, success: Boolean, reason: String?) = Unit
+                }, { allowed.get() })
+            val payload = """{"unique_id":"id","state_topic":"root/VIN123/car.lock","value_template":"{{ value_json.raw_value }}","device":{"identifiers":["vin"]}}"""
+            try {
+                publisher.connect()
+                val until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+                while (connected.count == 2L && System.nanoTime() < until) Thread.sleep(10)
+                assertEquals(1L, connected.count)
+                publisher.publishDiscovery(HomeAssistantDiscovery.Message("homeassistant/binary_sensor/node/key/config", payload)) { }
+                assertTrue(dropped.await(10, TimeUnit.SECONDS)); assertTrue(lost.await(10, TimeUnit.SECONDS))
+                allowed.set(false); publisher.connect(); assertTrue(connected.await(10, TimeUnit.SECONDS))
+                assertFalse("Paho replayed an unacknowledged tombstone after disabling discovery", replayed.get(10, TimeUnit.SECONDS))
+            } finally { stop(publisher); executor.shutdownNow() }
+        }
+    }
+
+    @Test fun timeoutDuringPermissionCheckCannotDispatchLatePublish() {
+        ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { server ->
+            val executor = Executors.newCachedThreadPool()
+            val release = CountDownLatch(1); val checked = CountDownLatch(1); val checkWire = CountDownLatch(1)
+            val noPublish = executor.submit<Boolean> {
+                server.accept().use { socket ->
+                    socket.soTimeout = 1500
+                    val input = DataInputStream(socket.getInputStream()); val out = socket.getOutputStream()
+                    check(readPacket(input).first == 0x10); out.write(byteArrayOf(0x20, 2, 0, 0)); out.flush()
+                    check(checkWire.await(20, TimeUnit.SECONDS))
+                    try { readPacket(input).first shr 4 != 3 } catch (_: java.net.SocketTimeoutException) { true }
+                }
+            }
+            val connected = CountDownLatch(1); val completed = CountDownLatch(1)
+            val outcome = AtomicReference<Boolean>()
+            val config = GatewayConfig(true, false, "tcp://127.0.0.1:${server.localPort}", "", "test/discovery")
+            val publisher = MqttPublisher(temporaryFolder.newFolder(), config, MqttCredentials.from("", null),
+                object : MqttPublisher.Listener {
+                    override fun onConnected(reconnecting: Boolean) { connected.countDown() }
+                    override fun onDisconnected(reason: String) = Unit
+                    override fun onPublishComplete(envelope: TelemetryEnvelope, success: Boolean, reason: String?) = Unit
+                }, { checked.countDown(); release.await(20, TimeUnit.SECONDS); true })
+            try {
+                publisher.connect(); assertTrue(connected.await(10, TimeUnit.SECONDS))
+                val send = executor.submit { publisher.publishDiscovery(HomeAssistantDiscovery.build("VIN123", "speed")!!) { outcome.set(it); completed.countDown() } }
+                assertTrue(checked.await(5, TimeUnit.SECONDS))
+                assertTrue("Timeout must not wait for a permission check", completed.await(15, TimeUnit.SECONDS))
+                assertEquals(false, outcome.get()); release.countDown(); send.get(5, TimeUnit.SECONDS); checkWire.countDown()
+                assertTrue("Publish was dispatched after timeout", noPublish.get(5, TimeUnit.SECONDS))
+            } finally { release.countDown(); checkWire.countDown(); stop(publisher); executor.shutdownNow() }
+        }
+    }
+
+    @Test fun unacknowledgedDiscoveryTimesOutAndDoesNotContinueAfterLateAck() {
+        ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { server ->
+            val executor = Executors.newSingleThreadExecutor(); val received = CountDownLatch(1); val ack = CountDownLatch(1)
+            val noNext = executor.submit<Boolean> {
+                server.accept().use { socket ->
+                    socket.soTimeout = 1000
+                    val input = DataInputStream(socket.getInputStream()); val out = socket.getOutputStream()
+                    check(readPacket(input).first == 0x10); out.write(byteArrayOf(0x20, 2, 0, 0)); out.flush()
+                    val (_, body) = readPacket(input); val len = ((body[0].toInt() and 255) shl 8) or (body[1].toInt() and 255)
+                    received.countDown(); check(ack.await(25, TimeUnit.SECONDS))
+                    out.write(byteArrayOf(0x40, 2, body[2 + len], body[3 + len])); out.flush()
+                    try { readPacket(input); false } catch (_: java.net.SocketTimeoutException) { true }
+                }
+            }
+            val connected = CountDownLatch(1); val completed = CountDownLatch(1); val outcome = AtomicReference<Boolean>()
+            val config = GatewayConfig(true, false, "tcp://127.0.0.1:${server.localPort}", "", "test/discovery")
+            val publisher = MqttPublisher(temporaryFolder.newFolder(), config, MqttCredentials.from("", null),
+                object : MqttPublisher.Listener {
+                    override fun onConnected(reconnecting: Boolean) { connected.countDown() }
+                    override fun onDisconnected(reason: String) = Unit
+                    override fun onPublishComplete(envelope: TelemetryEnvelope, success: Boolean, reason: String?) = Unit
+                })
+            val payload = """{"unique_id":"id","state_topic":"root/VIN123/car.lock","value_template":"{{ value_json.raw_value }}","device":{"identifiers":["vin"]}}"""
+            try {
+                publisher.connect(); assertTrue(connected.await(10, TimeUnit.SECONDS))
+                publisher.publishDiscovery(HomeAssistantDiscovery.Message("homeassistant/binary_sensor/node/key/config", payload)) { outcome.set(it); completed.countDown() }
+                assertTrue(received.await(10, TimeUnit.SECONDS))
+                assertTrue("Discovery did not time out", completed.await(20, TimeUnit.SECONDS)); assertEquals(false, outcome.get())
+                ack.countDown(); assertTrue("Late acknowledgement advanced migration", noNext.get(10, TimeUnit.SECONDS))
+            } finally { ack.countDown(); stop(publisher); executor.shutdownNow() }
         }
     }
 

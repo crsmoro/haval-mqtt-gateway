@@ -11,7 +11,7 @@ import org.junit.Test
 class HomeAssistantDiscoveryTest {
     @Test fun everySelectedReadOnlyObservationCanHaveAnEntity() {
         (IndependentVehicleState.keys + listOf("haval.power.ice", "haval.power.flow")).forEach { key ->
-            assertTrue("No discovery for $key", HomeAssistantDiscovery.build("1HGCM82633A004352", key) != null)
+            assertTrue("No discovery for $key", HomeAssistantDiscovery.build("VIN123", key) != null)
         }
     }
     @Test
@@ -22,7 +22,7 @@ class HomeAssistantDiscoveryTest {
         val otherPayload = JsonParser.parseString(other.payload).asJsonObject
         assertTrue(message.topic.startsWith("homeassistant/binary_sensor/"))
         assertEquals("gwm/haval/VIN123/haval.power.ice", payload.get("state_topic").asString)
-        assertEquals("{{ value_json.raw_value }}", payload.get("value_template").asString)
+        assertTrue(payload.get("value_template").asString.contains("value | from_json({})"))
         assertEquals("1", payload.get("payload_on").asString)
         assertEquals("0", payload.get("payload_off").asString)
         assertEquals("vin_56494e313233_key_686176616c2e706f7765722e696365", payload.get("unique_id").asString)
@@ -63,7 +63,7 @@ class HomeAssistantDiscoveryTest {
         val payload = JsonParser.parseString(message.payload).asJsonObject
         assertEquals("gwm/haval/VIN123/car.basic.left_turn_Indicator_light_status", payload.get("state_topic").asString)
         assertEquals("{{ value_json.raw_value }}", payload.get("value_template").asString)
-        assertEquals("car.basic.left_turn_Indicator_light_status", payload.get("name").asString)
+        assertEquals("Indicador de seta esquerda no painel", payload.get("name").asString)
     }
 
     @Test

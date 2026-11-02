@@ -34,14 +34,16 @@ class GatewayConfigStore(context: Context) {
 
     fun save(config: GatewayConfig, password: String?): Boolean {
         if (password != null && !secrets.save(password)) return false
-        prefs.edit()
-            .putBoolean(KEY_ENABLED, config.enabled)
-            .putBoolean(KEY_AUTO_START, config.autoStart)
-            .putString(KEY_BROKER_URI, config.brokerUri.trim())
-            .putString(KEY_USERNAME, config.username.trim())
-            .putString(KEY_TOPIC_PREFIX, config.topicPrefix.trim().trim('/'))
-            .putBoolean(KEY_HOME_ASSISTANT, config.publishHomeAssistant)
-            .apply()
+        DiscoveryDispatchGate.change {
+            prefs.edit()
+                .putBoolean(KEY_ENABLED, config.enabled)
+                .putBoolean(KEY_AUTO_START, config.autoStart)
+                .putString(KEY_BROKER_URI, config.brokerUri.trim())
+                .putString(KEY_USERNAME, config.username.trim())
+                .putString(KEY_TOPIC_PREFIX, config.topicPrefix.trim().trim('/'))
+                .putBoolean(KEY_HOME_ASSISTANT, config.publishHomeAssistant)
+                .apply()
+        }
         return true
     }
 
