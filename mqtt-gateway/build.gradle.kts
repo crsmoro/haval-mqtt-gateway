@@ -34,6 +34,8 @@ dependencies {
     implementation(libs.lifecycle.service)
     implementation(libs.gson)
     implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 
     testImplementation(libs.junit)
     testImplementation(libs.gson)

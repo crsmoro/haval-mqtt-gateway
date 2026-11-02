@@ -1,36 +1,41 @@
 # Haval MQTT Gateway
 
-Standalone Android companion app for the Haval head unit. It consumes the existing Haval App Tool read-only broadcasts and publishes selected vehicle telemetry to an MQTT broker. It does not read CAN/AIDL directly and does not send vehicle commands.
+Aplicativo Android independente para a central do Haval. Lê propriedades veiculares por meio do serviço OEM e do Shizuku e as publica em MQTT. Não depende do Haval App Tool, não usa seus broadcasts, não publica dados de navegação ou Android Auto e não envia comandos ao veículo.
 
 ## Requirements
 
 - Android 9 / API 28 or newer (built with compile SDK 36).
-- Haval App Tool installed and its vehicle service initialized on the same head unit.
+- Shizuku em execução na central e autorizado especificamente para o Haval MQTT Gateway. A disponibilidade do serviço OEM e das propriedades depende da central e do firmware.
 - An MQTT broker reachable from the head unit. Configure TLS with `ssl://host:8883`. Anonymous `tcp://` is allowed only on a trusted local network and is shown as insecure; the gateway rejects TCP when a username or password is configured.
 
 ## Setup
 
-1. Install `mqtt-gateway-debug.apk` on the same head unit as Haval App Tool.
-2. Open **Haval MQTT Gateway** and enter the broker URI, optional username/password, and topic prefix.
-3. Use a unique broker credential for this head unit and grant it publish-only ACLs. The app stores the password encrypted using Android Keystore.
-4. Tap **Salvar e iniciar gateway**. Enable auto-start only if the gateway should run after reboots.
-5. Check the notification/status. The gateway waits for `app.impulse.api_version=1`, requests `com.haval.vehicle.REQUEST_SNAPSHOT`, and consumes `com.haval.vehicle.EVENT_CHANGED`.
+1. Instale `mqtt-gateway-debug.apk` na central e inicie o Shizuku.
+2. Abra **Haval MQTT Gateway**, selecione **Autorizar acesso veicular via Shizuku** e conceda a permissão.
+3. Configure a URI do broker, usuário/senha opcionais e prefixo dos tópicos. Use TLS e credenciais específicas com ACL apenas de publicação; a senha é protegida pelo Android Keystore.
+4. Se desejado, marque **Publicar no Home Assistant** para criar automaticamente um dispositivo MQTT e sensores para os valores observados. Ative a inicialização automática apenas se desejado e selecione **Salvar e iniciar gateway**.
+5. Confira o estado na tela ou notificação. O serviço veicular OEM deve estar disponível para o Shizuku.
 
-Example topic:
+O prefixo padrão é `gwm`. O gateway aguarda um VIN válido e publica em `<prefixo>/haval/<VIN>/<chave>`. O prefixo antigo padrão `haval/telemetry` é migrado para `gwm`; outros prefixos existentes são preservados. A alteração dos tópicos exige atualizar consumidores antigos.
+
+Example topics:
 
 ```text
-haval/telemetry/<vehicle-id>/car.basic.vehicle_speed
+gwm/haval/<VIN>/car.basic.vehicle_speed
+my-prefix/haval/<VIN>/car.basic.vehicle_speed
 ```
 
-Payloads are JSON with `schema_version`, pseudonymous `vehicle_id`, UTC receive timestamp, sequence, source API version, key, raw string value, and `source_trust: "unauthenticated_local_broadcast"`. MQTT QoS is 1; messages are not retained. The app does not subscribe to MQTT command topics.
+Payloads are JSON with `schema_version`, `vehicle_id` (the complete prefix including VIN), UTC observation timestamp, sequence, `app_api_version: 0`, key, raw string value, `source: "vehicle_oem_binder"` and `source_trust: "shizuku_oem_binder"`. Derived signals use `vehicle_derived` and `derived_from_shizuku_oem_binder`. MQTT client IDs derive from the prefix and a random, locally persisted installation ID; updating changes the broker session ID. Telemetry uses QoS 1 and is not retained. The app does not subscribe to MQTT command topics.
+
+Com a opção do Home Assistant, mensagens de configuração MQTT Discovery são publicadas sob `homeassistant/` com QoS 1 e retenção, usando os tópicos de telemetria como estados. O Home Assistant precisa estar conectado ao mesmo broker, com MQTT Discovery habilitado. Desmarcar a opção interrompe novas publicações de Discovery, mas mantém as configurações retidas e entidades existentes. Valores sem semântica comprovada são sensores genéricos; `haval.power.ice` é um sensor binário inferido, não uma leitura de ignição. Como os estados não são retidos, o gateway republica observações em cache após o Discovery e a cada 60 segundos enquanto a fonte estiver conectada. Essas mensagens têm `cached: true` e mantêm o horário original; não garantem leitura nova.
 
 ## Data/privacy limits
 
-- Export scope is `car.*` and `haval.power.*`, with filters for VIN, DMS/FRS/OMS, `app.*`, `sys.*`, keys ending in `_action`, `_command`, `_request`, or `_oneshot`, `.request_` keys, and known command-only keys such as `car.beantechs.sota_start`. The producer does not label events with read/write semantics; this is a conservative name-based filter, not a complete typed allowlist. The gateway only publishes MQTT messages and never subscribes to command topics.
-- Coverage is limited to keys emitted by the source app's public bus. It includes its default monitored keys and any user-selected/dynamically monitored keys, but does not add new source subscriptions.
-- Per-wheel TPMS and TSR reads used only by the theme WebView are not automatically included in the public broadcast. The source app must expose these through a versioned read-only API/broadcast if they are required.
-- The source broadcast is public and has no sender authentication. Do not use this feed for safety-critical decisions. Treat it as untrusted telemetry.
-- While offline, the gateway coalesces to the latest value per key in an in-memory queue capped at 2,048 keys and a conservative 1 MiB payload budget, and requests a fresh snapshot after reconnect. It is not a durable event-history store; transitions during an outage may be missed. Input is capped at 500 broadcasts per second; excess events are dropped.
+- Os dados publicados podem incluir VIN e informações de ocupantes. Proteja o broker com TLS e ACLs restritivas; o prefixo também é copiado para `vehicle_id`. TCP anônimo expõe os dados na rede.
+- A seleção de propriedades veiculares está no código. Uma propriedade catalogada não garante que exista, seja legível ou produza valores no seu veículo. A compatibilidade de Shizuku, serviço OEM e firmware precisa ser testada na central.
+- Não publica `app.*`, navegação, Android Auto, telefone, dados de SIM ou rede. `haval.power.ice` e `haval.power.flow` são inferências, não medições. O fluxo requer RPM, carregamento e um estado OEM reconhecido; para estados desconhecidos não é inventado um valor. Não reproduz a inferência AWD do Haval App Tool e precisa de validação no veículo.
+- A leitura usa Binder do serviço OEM via Shizuku e não executa operações de comando. Não use a telemetria para decisões críticas de segurança.
+- Sem rede, o gateway mantém o último valor por chave em memória, limitado a 2.048 chaves e aproximadamente 1 MiB. Ao reconectar ao MQTT, republica as últimas observações com seus horários originais; elas podem estar desatualizadas. Não é armazenamento durável de histórico.
 
 ## Build and tests
 

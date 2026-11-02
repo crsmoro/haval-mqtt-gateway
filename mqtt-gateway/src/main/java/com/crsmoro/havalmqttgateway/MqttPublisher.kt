@@ -8,14 +8,17 @@ import org.eclipse.paho.client.mqttv3.MqttCallbackExtended
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions
 import org.eclipse.paho.client.mqttv3.persist.MqttDefaultFilePersistence
 import org.eclipse.paho.client.mqttv3.MqttMessage
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 internal class MqttPublisher(
-    context: Context,
+    persistenceDir: File,
     private val config: GatewayConfig,
     private val credentials: MqttCredentials,
     private val listener: Listener
 ) {
+    constructor(context: Context, config: GatewayConfig, credentials: MqttCredentials, listener: Listener) :
+        this(context.applicationContext.getDir("mqtt-persistence", Context.MODE_PRIVATE), config, credentials, listener)
     interface Listener {
         fun onConnected(reconnecting: Boolean)
         fun onDisconnected(reason: String)
@@ -26,10 +29,10 @@ internal class MqttPublisher(
     private val connecting = AtomicBoolean(false)
 
     init {
-        val persistenceDir = context.applicationContext.getDir("mqtt-persistence", Context.MODE_PRIVATE)
         client = MqttAsyncClient(
             config.brokerUri,
-            "haval-gateway-${config.vehicleId}",
+            if (config.clientInstanceId.isNotBlank()) MqttClientIdBuilder.fromInstallation(config.topicPrefix, config.clientInstanceId)
+            else MqttClientIdBuilder.fromTopicPrefix(config.topicPrefix),
             MqttDefaultFilePersistence(persistenceDir.absolutePath)
         )
         client.setCallback(object : MqttCallbackExtended {
@@ -87,7 +90,7 @@ internal class MqttPublisher(
     fun isConnected(): Boolean = client.isConnected
 
     fun publish(envelope: TelemetryEnvelope) {
-        val topic = MqttTopicBuilder.build(config.topicPrefix, config.vehicleId, envelope.key)
+        val topic = MqttTopicBuilder.build(envelope.topicPrefix, envelope.key)
         if (topic == null) {
             listener.onPublishComplete(envelope, success = false, reason = "Tópico inválido")
             return
@@ -127,6 +130,37 @@ internal class MqttPublisher(
                 )
             }
         )
+    }
+
+    fun publishDiscovery(message: HomeAssistantDiscovery.Message, onComplete: (Boolean) -> Unit) {
+        val completed = AtomicBoolean(false)
+        fun complete(success: Boolean) {
+            if (completed.compareAndSet(false, true)) onComplete(success)
+        }
+        try {
+            if (!client.isConnected) {
+                complete(false)
+                return
+            }
+            val mqttMessage = MqttMessage(message.payload.toByteArray(Charsets.UTF_8)).apply {
+                qos = message.qos
+                isRetained = message.retained
+            }
+            client.publish(message.topic, mqttMessage, null, object : IMqttActionListener {
+                override fun onSuccess(asyncActionToken: org.eclipse.paho.client.mqttv3.IMqttToken?) {
+                    complete(true)
+                }
+
+                override fun onFailure(
+                    asyncActionToken: org.eclipse.paho.client.mqttv3.IMqttToken?,
+                    exception: Throwable?
+                ) {
+                    complete(false)
+                }
+            })
+        } catch (_: Throwable) {
+            complete(false)
+        }
     }
 
     fun disconnect(onComplete: () -> Unit = {}) {

@@ -6,25 +6,34 @@ import org.junit.Test
 
 class MqttTopicBuilderTest {
     @Test
-    fun buildsPerVehicleTopicFromPrefixAndCanonicalKey() {
+    fun buildsTopicFromConfiguredPrefixAndCanonicalKey() {
         assertEquals(
-            "haval/telemetry/vehicle_123/car.basic.vehicle_speed",
-            MqttTopicBuilder.build("/haval/telemetry/", "vehicle_123", "car.basic.vehicle_speed")
+            "haval/telemetry/gwmbrasil_1hgcm82633a004352/car.basic.vehicle_speed",
+            MqttTopicBuilder.build(
+                "/haval/telemetry/gwmbrasil_1hgcm82633a004352/",
+                "car.basic.vehicle_speed"
+            )
+        )
+    }
+
+    @Test
+    fun normalizesAndUsesConfiguredPrefixAsIdentity() {
+        assertEquals(
+            "haval/telemetry/garage",
+            MqttTopicBuilder.normalizePrefix(" /haval/telemetry/garage/ ")
         )
     }
 
     @Test
     fun rejectsWildcardsAndEmptySegments() {
-        assertNull(MqttTopicBuilder.build("haval/+/telemetry", "vehicle_123", "car.basic.vehicle_speed"))
-        assertNull(MqttTopicBuilder.build("haval/telemetry", "vehicle/#", "car.basic.vehicle_speed"))
-        assertNull(MqttTopicBuilder.build("haval/telemetry", "vehicle_123", "car.basic/#"))
-        assertNull(MqttTopicBuilder.build("haval//telemetry", "vehicle_123", "car.basic.vehicle_speed"))
+        assertNull(MqttTopicBuilder.build("haval/+/telemetry", "car.basic.vehicle_speed"))
+        assertNull(MqttTopicBuilder.build("haval//telemetry", "car.basic.vehicle_speed"))
+        assertNull(MqttTopicBuilder.build("haval/telemetry", "car.basic/#"))
     }
 
     @Test
     fun rejectsBlankFields() {
-        assertNull(MqttTopicBuilder.build("", "vehicle_123", "car.basic.vehicle_speed"))
-        assertNull(MqttTopicBuilder.build("haval/telemetry", "", "car.basic.vehicle_speed"))
-        assertNull(MqttTopicBuilder.build("haval/telemetry", "vehicle_123", " "))
+        assertNull(MqttTopicBuilder.build("", "car.basic.vehicle_speed"))
+        assertNull(MqttTopicBuilder.build("haval/telemetry", " "))
     }
 }

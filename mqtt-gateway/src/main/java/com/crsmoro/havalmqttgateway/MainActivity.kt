@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.text.InputType
 import android.view.ViewGroup
@@ -17,6 +18,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import java.net.URI
+import rikka.shizuku.Shizuku
 
 class MainActivity : Activity() {
     private lateinit var store: GatewayConfigStore
@@ -25,9 +27,18 @@ class MainActivity : Activity() {
     private lateinit var password: EditText
     private lateinit var topicPrefix: EditText
     private lateinit var autoStart: CheckBox
+    private lateinit var publishHomeAssistant: CheckBox
     private lateinit var clearPassword: CheckBox
     private lateinit var statusView: TextView
     private var statusReceiverRegistered = false
+    private val permissionListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+        if (requestCode == SHIZUKU_REQUEST_CODE) {
+            runOnUiThread {
+                statusView.text = if (grantResult == PackageManager.PERMISSION_GRANTED)
+                    "Shizuku autorizado; aguardando fonte veicular" else "Permissão Shizuku negada"
+            }
+        }
+    }
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -50,7 +61,7 @@ class MainActivity : Activity() {
             textSize = 24f
         })
         content.addView(TextView(this).apply {
-            text = "Gateway somente de saída: recebe a telemetria pública do Haval App Tool e publica no broker. Instale e inicie o Haval App Tool na mesma central."
+            text = "Gateway somente de saída: lê propriedades veiculares da central usando Shizuku e publica no broker. Inicie o Shizuku e autorize este aplicativo."
             textSize = 15f
             setPadding(0, dp(8), 0, dp(12))
         })
@@ -67,22 +78,32 @@ class MainActivity : Activity() {
         content.addView(clearPassword)
         topicPrefix = addField(content, "Prefixo de tópicos", config.topicPrefix)
         content.addView(TextView(this).apply {
-            text = "Tópico exemplo: ${config.topicPrefix}/${config.vehicleId}/car.basic.vehicle_speed"
+            text = "Tópico exemplo: ${config.topicPrefix}/haval/<VIN>/car.basic.vehicle_speed"
             textSize = 12f
             setPadding(0, dp(3), 0, dp(10))
+        })
+        content.addView(TextView(this).apply {
+            text = "O VIN é incluído no tópico; o gateway aguarda um VIN válido antes de publicar."
+            textSize = 12f
+            setPadding(0, dp(3), 0, dp(8))
         })
         autoStart = CheckBox(this).apply {
             text = "Iniciar automaticamente após reiniciar a central"
             isChecked = config.autoStart
         }
         content.addView(autoStart)
+        publishHomeAssistant = CheckBox(this).apply {
+            text = "Publicar no Home Assistant"
+            isChecked = config.publishHomeAssistant
+        }
+        content.addView(publishHomeAssistant)
         content.addView(TextView(this).apply {
-            text = "Privacidade: exclui VIN, DMS/FRS/OMS, app/sys e chaves de ação conhecidas por nome; o produtor não tipa leitura versus comando, então o filtro não é completo. O broadcast local não autentica o emissor; trate os dados como não confiáveis, nunca como sinal de segurança veicular."
+            text = "Privacidade: a telemetria pode incluir VIN e dados de ocupantes. Use TLS e restrinja o acesso ao broker. O prefixo também aparece no campo vehicle_id. Não use estes dados para decisões de segurança veicular."
             textSize = 12f
             setPadding(0, dp(8), 0, dp(6))
         })
         content.addView(TextView(this).apply {
-            text = "Sem rede, coalesce o último valor por chave em fila volátil limitada a 1 MiB/2.048 chaves e pede snapshot ao reconectar. Entrada acima de 500 eventos/s é descartada; não é histórico durável."
+            text = "Sem rede, guarda o último valor por chave em memória. Ao reconectar ao MQTT, republica os últimos valores observados, que podem estar desatualizados; não é histórico durável."
             textSize = 12f
             setPadding(0, 0, 0, dp(12))
         })
@@ -98,6 +119,10 @@ class MainActivity : Activity() {
         content.addView(statusView)
 
         content.addView(Button(this).apply {
+            text = "Autorizar acesso veicular via Shizuku"
+            setOnClickListener { requestVehiclePermission() }
+        })
+        content.addView(Button(this).apply {
             text = "Salvar e iniciar gateway"
             setOnClickListener { saveAndStart() }
         })
@@ -105,17 +130,12 @@ class MainActivity : Activity() {
             text = "Parar gateway"
             setOnClickListener { stopGateway() }
         })
-        content.addView(TextView(this).apply {
-            text = "ID pseudônimo desta central: ${config.vehicleId}"
-            textSize = 11f
-            setPadding(0, dp(14), 0, 0)
-        })
-
         setContentView(ScrollView(this).apply { addView(content) })
     }
 
     override fun onResume() {
         super.onResume()
+        Shizuku.addRequestPermissionResultListener(permissionListener)
         if (!statusReceiverRegistered) {
             ContextCompat.registerReceiver(
                 this,
@@ -129,11 +149,27 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        Shizuku.removeRequestPermissionResultListener(permissionListener)
         if (statusReceiverRegistered) {
             runCatching { unregisterReceiver(statusReceiver) }
             statusReceiverRegistered = false
         }
         super.onPause()
+    }
+
+    private fun requestVehiclePermission() {
+        try {
+            when {
+                !Shizuku.pingBinder() -> showError("Inicie o Shizuku antes de autorizar o gateway.")
+                Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED ->
+                    showError("Este gateway já está autorizado no Shizuku.")
+                Shizuku.shouldShowRequestPermissionRationale() ->
+                    showError("Permissão negada anteriormente. Autorize o gateway nas configurações do Shizuku.")
+                else -> Shizuku.requestPermission(SHIZUKU_REQUEST_CODE)
+            }
+        } catch (_: RuntimeException) {
+            showError("Não foi possível solicitar autorização ao Shizuku.")
+        }
     }
 
     private fun saveAndStart() {
@@ -146,16 +182,15 @@ class MainActivity : Activity() {
             showError("URI inválida. Informe ssl://host:8883 ou tcp://host:1883, sem usuário/senha na URI.")
             return
         }
-        val current = store.load()
         val next = GatewayConfig(
             enabled = true,
             autoStart = autoStart.isChecked,
             brokerUri = uri,
             username = username.text.toString().trim(),
             topicPrefix = topicPrefix.text.toString().trim(),
-            vehicleId = current.vehicleId
+            publishHomeAssistant = publishHomeAssistant.isChecked
         )
-        if (MqttTopicBuilder.build(next.topicPrefix, next.vehicleId, "car.basic.vehicle_speed") == null) {
+        if (MqttTopicBuilder.build(next.topicPrefix, "car.basic.vehicle_speed") == null) {
             showError("Prefixo de tópico inválido. Não use +, #, espaços ou segmentos vazios.")
             return
         }
@@ -216,4 +251,8 @@ class MainActivity : Activity() {
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    companion object {
+        private const val SHIZUKU_REQUEST_CODE = 1201
+    }
 }

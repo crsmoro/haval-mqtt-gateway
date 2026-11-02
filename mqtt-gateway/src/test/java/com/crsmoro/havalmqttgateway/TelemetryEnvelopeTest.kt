@@ -11,7 +11,7 @@ class TelemetryEnvelopeTest {
     fun serializesRawValueAndMetadataWithoutGuessingUnits() {
         val observedAt = Instant.parse("2026-10-22T12:34:56.789Z")
         val envelope = TelemetryEnvelope(
-            vehicleId = "vehicle-123",
+            topicPrefix = "haval/telemetry/garage",
             key = "car.basic.vehicle_speed",
             rawValue = "42.0",
             observedAt = observedAt,
@@ -22,7 +22,7 @@ class TelemetryEnvelopeTest {
 
         val json = JsonParser.parseString(envelope.toJson()).asJsonObject
         assertEquals(1, json.get("schema_version").asInt)
-        assertEquals("vehicle-123", json.get("vehicle_id").asString)
+        assertEquals("haval/telemetry/garage", json.get("vehicle_id").asString)
         assertEquals("car.basic.vehicle_speed", json.get("key").asString)
         assertEquals("42.0", json.get("raw_value").asString)
         assertEquals(observedAt.toString(), json.get("observed_at").asString)

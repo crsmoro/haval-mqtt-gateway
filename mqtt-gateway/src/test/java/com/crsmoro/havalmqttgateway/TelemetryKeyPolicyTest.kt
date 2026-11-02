@@ -13,13 +13,13 @@ class TelemetryKeyPolicyTest {
     }
 
     @Test
-    fun excludesAppSystemAndPersonalData() {
+    fun excludesAppSystemAndVehicleCommandsButAllowsSensitiveReadings() {
         assertFalse(TelemetryKeyPolicy.isPublishable("app.phone.caller_number"))
         assertFalse(TelemetryKeyPolicy.isPublishable("app.navigation.directions"))
         assertFalse(TelemetryKeyPolicy.isPublishable("sys.settings.display.brightness"))
-        assertFalse(TelemetryKeyPolicy.isPublishable("car.basic.vin_code"))
-        assertFalse(TelemetryKeyPolicy.isPublishable("car.dms.frs.gaze_area"))
-        assertFalse(TelemetryKeyPolicy.isPublishable("car.frs_setting.driver_age"))
+        assertTrue(TelemetryKeyPolicy.isPublishable("car.basic.vin_code"))
+        assertTrue(TelemetryKeyPolicy.isPublishable("car.dms.frs.gaze_area"))
+        assertTrue(TelemetryKeyPolicy.isPublishable("car.frs_setting.driver_age"))
         assertFalse(TelemetryKeyPolicy.isPublishable("car.basic.door_control_action"))
         assertFalse(TelemetryKeyPolicy.isPublishable("car.hvac.request_hvac_info"))
     }
@@ -50,10 +50,10 @@ class TelemetryKeyPolicyTest {
     }
 
     @Test
-    fun rejectsOccupantMonitoringAndBiometricData() {
-        assertFalse(TelemetryKeyPolicy.isPublishable("car.oms.feedback.age_state"))
-        assertFalse(TelemetryKeyPolicy.isPublishable("car.oms.feedback.gender_state"))
-        assertFalse(TelemetryKeyPolicy.isPublishable("car.oms.frs.oms_facedb"))
-        assertFalse(TelemetryKeyPolicy.isPublishable("car.oms.frs.passengerm_row1_expression"))
+    fun allowsOccupantMonitoringData() {
+        assertTrue(TelemetryKeyPolicy.isPublishable("car.oms.feedback.age_state"))
+        assertTrue(TelemetryKeyPolicy.isPublishable("car.oms.feedback.gender_state"))
+        assertTrue(TelemetryKeyPolicy.isPublishable("car.oms.frs.oms_facedb"))
+        assertTrue(TelemetryKeyPolicy.isPublishable("car.oms.frs.passengerm_row1_expression"))
     }
 }
